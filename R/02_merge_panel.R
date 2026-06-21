@@ -33,9 +33,7 @@ duplicate_main_file <- "outputs/logs/duplicate_keys_main.csv"
 duplicate_add_file <- "outputs/logs/duplicate_keys_additional.csv"
 merge_quality_file <- "outputs/logs/merge_quality.csv"
 sample_flow_file <- "outputs/logs/sample_flow.md"
-unmatched_main_keys_file <- "outputs/logs/unmatched_main_keys.csv"
-unmatched_additional_keys_file <- "outputs/logs/unmatched_additional_keys.csv"
-unconvertible_year_values_file <- "outputs/logs/unconvertible_year_values.csv"
+year_cleaning_examples_file <- "outputs/logs/year_cleaning_examples.csv"
 
 # -----------------------------------------------------------------------------
 # 2. Helper functions
@@ -63,24 +61,75 @@ trim_column_names <- function(data) {
   data
 }
 
-# Read an Excel file while forcing the stock-code column to text when possible.
-# This helps protect leading zeros in stock codes such as "000001".
-read_panel_excel <- function(file_path, stock_column = stock_key) {
+# Read an Excel file while forcing the stock-code and year columns to text when
+# possible. This helps protect leading zeros in stock codes and prevents Excel
+# year/date values from being converted unpredictably before key normalization.
+read_panel_excel <- function(file_path, stock_column = stock_key, year_column = year_key) {
   header_only <- readxl::read_excel(file_path, n_max = 0)
   header_names <- stringr::str_trim(names(header_only))
 
   stock_position <- match(stock_column, header_names)
+  year_position <- match(year_column, header_names)
 
-  if (is.na(stock_position)) {
+  text_positions <- stats::na.omit(c(stock_position, year_position))
+
+  if (length(text_positions) == 0) {
     # The formal missing-column check below will report all missing keys.
     data <- readxl::read_excel(file_path)
   } else {
     col_types <- rep("guess", length(header_names))
-    col_types[stock_position] <- "text"
+    col_types[text_positions] <- "text"
     data <- readxl::read_excel(file_path, col_types = col_types)
   }
 
   trim_column_names(data)
+}
+
+# Normalize mixed year/date keys to integer calendar years. The function first
+# extracts explicit 1900-2100 years from text-like values, then treats remaining
+# numeric values as possible Excel serial dates.
+normalize_year_key <- function(year_values) {
+  valid_year <- function(year) {
+    !is.na(year) & year >= 1900L & year <= 2100L
+  }
+
+  if (inherits(year_values, "Date")) {
+    date_years <- as.integer(format(year_values, "%Y"))
+    date_years[!valid_year(date_years)] <- NA_integer_
+    return(date_years)
+  }
+
+  if (inherits(year_values, "POSIXt")) {
+    datetime_years <- as.integer(format(as.Date(year_values), "%Y"))
+    datetime_years[!valid_year(datetime_years)] <- NA_integer_
+    return(datetime_years)
+  }
+
+  year_text <- stringr::str_trim(as.character(year_values))
+  year_text[year_text %in% c("", "NA", "NaN")] <- NA_character_
+
+  explicit_year <- stringr::str_extract(year_text, "19\\d{2}|20\\d{2}|2100")
+  cleaned_year <- suppressWarnings(as.integer(explicit_year))
+
+  unresolved <- is.na(cleaned_year) & !is.na(year_text)
+  numeric_values <- suppressWarnings(as.numeric(year_text[unresolved]))
+  max_excel_serial <- as.numeric(as.Date("2100-12-31") - as.Date("1899-12-30"))
+  possible_serial <- !is.na(numeric_values) &
+    numeric_values >= 1 &
+    numeric_values <= max_excel_serial
+
+  serial_years <- rep(NA_integer_, length(numeric_values))
+  serial_dates <- as.Date(rep(NA_real_, length(numeric_values)), origin = "1899-12-30")
+  serial_dates[possible_serial] <- as.Date(
+    numeric_values[possible_serial],
+    origin = "1899-12-30"
+  )
+  serial_years[possible_serial] <- as.integer(format(serial_dates[possible_serial], "%Y"))
+  serial_years[!valid_year(serial_years)] <- NA_integer_
+  cleaned_year[unresolved] <- serial_years
+
+  cleaned_year[!valid_year(cleaned_year)] <- NA_integer_
+  cleaned_year
 }
 
 # Confirm that all required merge keys exist in a dataset.
@@ -101,122 +150,57 @@ check_required_columns <- function(data, required_columns, dataset_label) {
   }
 }
 
-# Normalize stock codes before merging.
-normalize_stock_key <- function(stock_values) {
-  stock_chr <- stringr::str_trim(as.character(stock_values))
-  stock_chr <- stringr::str_replace(stock_chr, "\\.0$", "")
-
-  should_pad <- !is.na(stock_chr) &
-    stringr::str_detect(stock_chr, "^[0-9]+$") &
-    stringr::str_length(stock_chr) > 0 &
-    stringr::str_length(stock_chr) < 6
-
-  stock_chr[should_pad] <- stringr::str_pad(
-    stock_chr[should_pad],
-    width = 6,
-    side = "left",
-    pad = "0"
-  )
-
-  stock_chr
-}
-
-# Convert Excel serial dates to calendar years when the raw value looks like an
-# Excel date rather than a year. Excel's common Windows date origin is used.
-excel_serial_to_year <- function(raw_values) {
-  numeric_values <- suppressWarnings(as.numeric(raw_values))
-  possible_excel_date <- !is.na(numeric_values) &
-    numeric_values >= 1 &
-    numeric_values <= 80000 &
-    !(numeric_values >= 1900 & numeric_values <= 2100)
-
-  excel_year <- rep(NA_integer_, length(raw_values))
-  converted_dates <- as.Date(numeric_values[possible_excel_date], origin = "1899-12-30")
-  converted_years <- suppressWarnings(as.integer(format(converted_dates, "%Y")))
-  valid_converted_years <- converted_years >= 1900 & converted_years <= 2100
-
-  excel_indices <- which(possible_excel_date)
-  excel_year[excel_indices[valid_converted_years]] <- converted_years[valid_converted_years]
-  excel_year
-}
-
-# Extract the first valid 4-digit year between 1900 and 2100. This handles raw
-# values such as 2010, "2010", "2010.0", "2010年", "FY2010", "2010-12-31",
-# and "2010/12/31". If no embedded year exists, Excel serial-date conversion is
-# attempted for numeric-looking values.
-normalize_year_key <- function(year_values) {
-  year_chr <- stringr::str_trim(as.character(year_values))
-  extracted_year_chr <- stringr::str_extract(year_chr, "(?<![0-9])(?:19[0-9]{2}|20[0-9]{2}|2100)(?![0-9])")
-  extracted_year <- suppressWarnings(as.integer(extracted_year_chr))
-  valid_extracted_year <- !is.na(extracted_year) & extracted_year >= 1900 & extracted_year <= 2100
-
-  normalized_year <- rep(NA_integer_, length(year_values))
-  normalized_year[valid_extracted_year] <- extracted_year[valid_extracted_year]
-
-  needs_excel_conversion <- is.na(normalized_year) & !is.na(year_values) & year_chr != ""
-  excel_year <- excel_serial_to_year(year_chr)
-  normalized_year[needs_excel_conversion & !is.na(excel_year)] <- excel_year[needs_excel_conversion & !is.na(excel_year)]
-
-  normalized_year
-}
-
-# Build a report of raw year values that still cannot be converted after the
-# enhanced year normalization. Empty or missing raw years are excluded so the
-# report focuses on problematic nonmissing source values.
-get_unconvertible_year_values <- function(original_data, cleaned_data, dataset_label) {
-  original_year_chr <- stringr::str_trim(as.character(original_data[[year_key]]))
-
-  tibble::tibble(
-    dataset = dataset_label,
-    raw_year_value = original_year_chr
-  ) %>%
-    dplyr::filter(
-      !is.na(.data$raw_year_value),
-      .data$raw_year_value != "",
-      is.na(cleaned_data[[year_key]])
-    ) %>%
-    dplyr::distinct() %>%
-    dplyr::arrange(.data$raw_year_value)
-}
-
 # Standardize merge keys without changing non-key variables.
 standardize_merge_keys <- function(data, dataset_label) {
-  cleaned_data <- data %>%
+  data %>%
     dplyr::mutate(
+      # Preserve stock codes as character strings and trim accidental spaces.
       dplyr::across(
         dplyr::all_of(stock_key),
-        normalize_stock_key
+        ~ stringr::str_trim(as.character(.x))
       ),
+      # Convert mixed year/date formats to integer years where possible.
+      # Non-convertible values become NA, and the warning is handled below.
       dplyr::across(
         dplyr::all_of(year_key),
-        normalize_year_key
+        ~ normalize_year_key(.x)
       )
-    )
-
-  unconvertible_years <- get_unconvertible_year_values(data, cleaned_data, dataset_label)
-
-  if (nrow(unconvertible_years) > 0) {
-    warning(
-      paste0(
-        "Some year values in ", dataset_label,
-        " could not be converted after extracting valid 4-digit years and ",
-        "checking Excel serial dates. They will be reported in ",
-        unconvertible_year_values_file, "."
-      ),
-      call. = FALSE
-    )
-  }
-
-  attr(cleaned_data, "unconvertible_years") <- unconvertible_years
-  cleaned_data
+    ) %>%
+    {
+      if (any(is.na(.[[year_key]]) & !is.na(data[[year_key]]))) {
+        warning(
+          paste0(
+            "Some year values in ", dataset_label,
+            " could not be converted to integer and were set to NA. ",
+            "Please inspect the source file."
+          ),
+          call. = FALSE
+        )
+      }
+      .
+    }
 }
 
-format_matching_rate <- function(rate) {
-  if (is.na(rate)) {
-    return(NA_character_)
+# Save examples of raw and cleaned year keys so date-like or mixed formats can
+# be audited without opening the raw Excel files.
+save_year_cleaning_examples <- function(main_raw, main_clean, add_raw, add_clean, output_path) {
+  build_examples <- function(raw_data, clean_data, dataset_label) {
+    tibble::tibble(
+      dataset = dataset_label,
+      raw_year_value = as.character(raw_data[[year_key]]),
+      cleaned_year_value = clean_data[[year_key]]
+    ) %>%
+      dplyr::distinct(.data$dataset, .data$raw_year_value, .data$cleaned_year_value) %>%
+      dplyr::slice_head(n = 25)
   }
 
-  paste0(format(round(rate * 100, 2), nsmall = 2), "%")
+  year_examples <- dplyr::bind_rows(
+    build_examples(main_raw, main_clean, "main"),
+    build_examples(add_raw, add_clean, "additional")
+  )
+
+  readr::write_csv(year_examples, output_path)
+  year_examples
 }
 
 # Save duplicate key diagnostics for a dataset. Empty reports are still saved so
@@ -239,20 +223,22 @@ save_duplicate_report <- function(data, dataset_label, output_path) {
 check_input_file(main_file)
 check_input_file(add_file)
 
-main_data <- read_panel_excel(main_file)
-add_data <- read_panel_excel(add_file)
+main_data_raw <- read_panel_excel(main_file)
+add_data_raw <- read_panel_excel(add_file)
 
-check_required_columns(main_data, merge_keys, "main dataset")
-check_required_columns(add_data, merge_keys, "additional dataset")
+check_required_columns(main_data_raw, merge_keys, "main dataset")
+check_required_columns(add_data_raw, merge_keys, "additional dataset")
 
-main_data <- standardize_merge_keys(main_data, "main dataset")
-add_data <- standardize_merge_keys(add_data, "additional dataset")
+main_data <- standardize_merge_keys(main_data_raw, "main dataset")
+add_data <- standardize_merge_keys(add_data_raw, "additional dataset")
 
-unconvertible_year_values <- dplyr::bind_rows(
-  attr(main_data, "unconvertible_years"),
-  attr(add_data, "unconvertible_years")
+year_cleaning_examples <- save_year_cleaning_examples(
+  main_data_raw,
+  main_data,
+  add_data_raw,
+  add_data,
+  year_cleaning_examples_file
 )
-readr::write_csv(unconvertible_year_values, unconvertible_year_values_file)
 
 # -----------------------------------------------------------------------------
 # 4. Duplicate-key checks
@@ -283,52 +269,41 @@ add_rows <- nrow(add_data)
 add_keys <- add_data %>%
   dplyr::distinct(dplyr::across(dplyr::all_of(merge_keys)))
 
-unmatched_main_keys <- main_data %>%
-  dplyr::distinct(dplyr::across(dplyr::all_of(merge_keys))) %>%
-  dplyr::anti_join(add_keys, by = merge_keys) %>%
-  dplyr::arrange(dplyr::across(dplyr::all_of(merge_keys)))
-
-main_keys <- main_data %>%
-  dplyr::distinct(dplyr::across(dplyr::all_of(merge_keys)))
-
-unmatched_additional_keys <- add_keys %>%
-  dplyr::anti_join(main_keys, by = merge_keys) %>%
-  dplyr::arrange(dplyr::across(dplyr::all_of(merge_keys)))
-
-matched_keys <- main_keys %>%
-  dplyr::inner_join(add_keys, by = merge_keys)
-
 unmatched_main_rows <- main_data %>%
   dplyr::anti_join(add_keys, by = merge_keys) %>%
   nrow()
 
-matched_key_count <- nrow(matched_keys)
-main_key_count <- nrow(main_keys)
-matching_rate <- if (main_key_count == 0) NA_real_ else matched_key_count / main_key_count
+main_keys <- main_data %>%
+  dplyr::distinct(dplyr::across(dplyr::all_of(merge_keys)))
 
-readr::write_csv(unmatched_main_keys, unmatched_main_keys_file)
-readr::write_csv(unmatched_additional_keys, unmatched_additional_keys_file)
+unmatched_main_keys <- main_keys %>%
+  dplyr::anti_join(add_keys, by = merge_keys) %>%
+  nrow()
 
-message("Matched stock-year keys after cleaning: ", matched_key_count)
-message("Matching rate after cleaning: ", format_matching_rate(matching_rate))
+unmatched_additional_keys <- add_keys %>%
+  dplyr::anti_join(main_keys, by = merge_keys) %>%
+  nrow()
 
 merged_panel <- main_data %>%
   dplyr::left_join(add_data, by = merge_keys)
 
 merged_rows <- nrow(merged_panel)
 row_count_increased <- merged_rows > main_rows
+matching_rate <- if (main_rows == 0) {
+  NA_real_
+} else {
+  (main_rows - unmatched_main_rows) / main_rows
+}
 
 merge_quality <- tibble::tibble(
   diagnostic = c(
     "main_rows",
     "additional_rows",
     "merged_rows",
-    "unmatched_main_rows",
-    "unmatched_main_key_count",
-    "unmatched_additional_key_count",
-    "matched_stock_year_key_count",
     "matching_rate",
-    "unconvertible_year_value_count",
+    "unmatched_main_rows",
+    "unmatched_main_keys",
+    "unmatched_additional_keys",
     "main_duplicate_key_count",
     "additional_duplicate_key_count",
     "row_count_increased_unexpectedly"
@@ -337,12 +312,10 @@ merge_quality <- tibble::tibble(
     as.character(main_rows),
     as.character(add_rows),
     as.character(merged_rows),
-    as.character(unmatched_main_rows),
-    as.character(nrow(unmatched_main_keys)),
-    as.character(nrow(unmatched_additional_keys)),
-    as.character(matched_key_count),
     as.character(matching_rate),
-    as.character(nrow(unconvertible_year_values)),
+    as.character(unmatched_main_rows),
+    as.character(unmatched_main_keys),
+    as.character(unmatched_additional_keys),
     as.character(nrow(main_duplicates)),
     as.character(nrow(add_duplicates)),
     as.character(row_count_increased)
@@ -360,12 +333,10 @@ sample_flow <- c(
   paste0("- Main dataset rows before merge: ", main_rows),
   paste0("- Additional dataset rows before merge: ", add_rows),
   paste0("- Rows after left join: ", merged_rows),
+  paste0("- Matching rate for main observations: ", round(matching_rate * 100, 2), "%"),
   paste0("- Unmatched observations from main dataset: ", unmatched_main_rows),
-  paste0("- Unmatched distinct stock-year keys from main dataset: ", nrow(unmatched_main_keys)),
-  paste0("- Unmatched distinct stock-year keys from additional dataset: ", nrow(unmatched_additional_keys)),
-  paste0("- Matched distinct stock-year keys after cleaning: ", matched_key_count),
-  paste0("- Matching rate after cleaning: ", format_matching_rate(matching_rate)),
-  paste0("- Unconvertible raw year values: ", nrow(unconvertible_year_values)),
+  paste0("- Unmatched distinct keys from main dataset: ", unmatched_main_keys),
+  paste0("- Unmatched distinct keys from additional dataset: ", unmatched_additional_keys),
   paste0("- Duplicate stock-year keys in main dataset: ", nrow(main_duplicates)),
   paste0("- Duplicate stock-year keys in additional dataset: ", nrow(add_duplicates)),
   paste0("- Row count increased unexpectedly: ", row_count_increased),
@@ -387,7 +358,5 @@ writexl::write_xlsx(merged_panel, output_file)
 message("Panel merge completed.")
 message("Merged dataset saved to: ", output_file)
 message("Merge diagnostics saved to: ", merge_quality_file)
-message("Unmatched main keys saved to: ", unmatched_main_keys_file)
-message("Unmatched additional keys saved to: ", unmatched_additional_keys_file)
-message("Unconvertible year values saved to: ", unconvertible_year_values_file)
+message("Year cleaning examples saved to: ", year_cleaning_examples_file)
 message("Sample flow saved to: ", sample_flow_file)
